@@ -163,24 +163,25 @@ module Vmpooler
     end
 
     def return_vm_to_ready_state(template, vm)
+      backend.srem("vmpooler__migrating__#{template}", vm)
+      backend.hdel("vmpooler__active__#{template}", vm)
+      backend.hdel("vmpooler__vm__#{vm}", 'checkout', 'token:token', 'token:user')
       backend.smove("vmpooler__running__#{template}", "vmpooler__ready__#{template}", vm)
     end
 
     def account_for_starting_vm(template, vm)
+      user = backend.hget("vmpooler__token__#{request.env['HTTP_X_AUTH_TOKEN']}", 'user')
+      has_token_result = has_token?
       backend.sadd("vmpooler__migrating__#{template}", vm)
       backend.hset("vmpooler__active__#{template}", vm, Time.now)
       backend.hset("vmpooler__vm__#{vm}", 'checkout', Time.now)
 
-      if Vmpooler::API.settings.config[:auth] and has_token?
-        validate_token(backend)
-
-        backend.hset('vmpooler__vm__' + vm, 'token:token', request.env['HTTP_X_AUTH_TOKEN'])
-        backend.hset('vmpooler__vm__' + vm, 'token:user',
-                     backend.hget('vmpooler__token__' + request.env['HTTP_X_AUTH_TOKEN'], 'user')
-        )
+      if Vmpooler::API.settings.config[:auth] and has_token_result
+        backend.hset("vmpooler__vm__#{vm}", 'token:token', request.env['HTTP_X_AUTH_TOKEN'])
+        backend.hset("vmpooler__vm__#{vm}", 'token:user', user)
 
         if config['vm_lifetime_auth'].to_i > 0
-          backend.hset('vmpooler__vm__' + vm, 'lifetime', config['vm_lifetime_auth'].to_i)
+          backend.hset("vmpooler__vm__#{vm}", 'lifetime', config['vm_lifetime_auth'].to_i)
         end
       end
     end
@@ -200,16 +201,19 @@ module Vmpooler
       failed = false
       vms = []
 
+      validate_token(backend) if Vmpooler::API.settings.config[:auth] and has_token?
+
       payload.each do |requested, count|
         count.to_i.times do |_i|
           vmname, vmpool, vmtemplate = fetch_single_vm(requested)
-          if !vmname
-            failed = true
-            metrics.increment('checkout.empty.' + requested)
-            break
-          else
+          if vmname
+            account_for_starting_vm(vmpool, vmname)
             vms << [vmpool, vmname, vmtemplate]
-            metrics.increment('checkout.success.' + vmtemplate)
+            metrics.increment("checkout.success.#{vmpool}")
+          else
+            failed = true
+            metrics.increment("checkout.empty.#{requested}")
+            break
           end
         end
       end
@@ -220,8 +224,7 @@ module Vmpooler
         end
         status 503
       else
-        vms.each do |(vmpool, vmname, vmtemplate)|
-          account_for_starting_vm(vmpool, vmname)
+        vms.each do |(_vmpool, vmname, vmtemplate)|
           update_result_hosts(result, vmtemplate, vmname)
         end
 
@@ -337,7 +340,7 @@ module Vmpooler
       payload&.each do |poolname, count|
         next unless count.to_i > config['max_ondemand_instances_per_request']
 
-        metrics.increment('ondemandrequest_fail.toomanyrequests.' + poolname)
+        metrics.increment("ondemandrequest_fail.toomanyrequests.#{poolname}")
         return true
       end
       false
@@ -380,7 +383,7 @@ module Vmpooler
       if Vmpooler::API.settings.config[:auth] and has_token?
         backend.hset("vmpooler__odrequest__#{request_id}", 'token:token', request.env['HTTP_X_AUTH_TOKEN'])
         backend.hset("vmpooler__odrequest__#{request_id}", 'token:user',
-                     backend.hget('vmpooler__token__' + request.env['HTTP_X_AUTH_TOKEN'], 'user'))
+                     backend.hget("vmpooler__token__#{request.env['HTTP_X_AUTH_TOKEN']}", 'user'))
       end
 
       result['domain'] = config['domain'] if config['domain']
@@ -542,9 +545,9 @@ module Vmpooler
           if subpool.include?(p['name'])
             true
           elsif !p['alias'].nil?
-            if p['alias'].is_a?(Array)
+            if p['alias'].instance_of?(Array)
               (p['alias'] & subpool).any?
-            elsif p['alias'].is_a?(String)
+            elsif p['alias'].instance_of?(String)
               subpool.include?(p['alias'])
             end
           end
@@ -727,14 +730,14 @@ module Vmpooler
       result = { 'ok' => false }
 
       if Vmpooler::API.settings.config[:auth]
-        token = backend.hgetall('vmpooler__token__' + params[:token])
+        token = backend.hgetall("vmpooler__token__#{params[:token]}")
 
         if not token.nil? and not token.empty?
           status 200
 
           pools.each do |pool|
-            backend.smembers('vmpooler__running__' + pool['name']).each do |vm|
-              if backend.hget('vmpooler__vm__' + vm, 'token:token') == params[:token]
+            backend.smembers("vmpooler__running__#{pool['name']}").each do |vm|
+              if backend.hget("vmpooler__vm__#{vm}", 'token:token') == params[:token]
                 token['vms'] ||= {}
                 token['vms']['running'] ||= []
                 token['vms']['running'].push(vm)
@@ -760,7 +763,7 @@ module Vmpooler
 
         need_auth!
 
-        if backend.del('vmpooler__token__' + params[:token]).to_i > 0
+        if backend.del("vmpooler__token__#{params[:token]}").to_i > 0
           status 200
           result['ok'] = true
         end
@@ -783,8 +786,8 @@ module Vmpooler
         o = [('a'..'z'), ('0'..'9')].map(&:to_a).flatten
         result['token'] = o[rand(25)] + (0...31).map { o[rand(o.length)] }.join
 
-        backend.hset('vmpooler__token__' + result['token'], 'user', @auth.username)
-        backend.hset('vmpooler__token__' + result['token'], 'created', Time.now)
+        backend.hset("vmpooler__token__#{result['token']}", 'user', @auth.username)
+        backend.hset("vmpooler__token__#{result['token']}", 'created', Time.now)
 
         status 200
         result['ok'] = true
@@ -823,7 +826,7 @@ module Vmpooler
           else
             result[:bad_templates] = invalid
             invalid.each do |bad_template|
-              metrics.increment('ondemandrequest_fail.invalid.' + bad_template)
+              metrics.increment("ondemandrequest_fail.invalid.#{bad_template}")
             end
             status 404
           end
@@ -858,7 +861,7 @@ module Vmpooler
         else
           result[:bad_templates] = invalid
           invalid.each do |bad_template|
-            metrics.increment('ondemandrequest_fail.invalid.' + bad_template)
+            metrics.increment("ondemandrequest_fail.invalid.#{bad_template}")
           end
           status 404
         end
@@ -904,7 +907,7 @@ module Vmpooler
           result = atomically_allocate_vms(payload)
         else
           invalid.each do |bad_template|
-            metrics.increment('checkout.invalid.' + bad_template)
+            metrics.increment("checkout.invalid.#{bad_template}")
           end
           status 404
         end
@@ -980,7 +983,8 @@ module Vmpooler
       result['ok'] = true
       status 202
 
-      if request_hash['status'] == 'ready'
+      case request_hash['status']
+      when 'ready'
         result['ready'] = true
         Parsing.get_platform_pool_count(request_hash['requested']) do |platform_alias, pool, _count|
           instances = backend.smembers("vmpooler__#{request_id}__#{platform_alias}__#{pool}")
@@ -993,10 +997,10 @@ module Vmpooler
         end
         result['domain'] = config['domain'] if config['domain']
         status 200
-      elsif request_hash['status'] == 'failed'
+      when 'failed'
         result['message'] = "The request failed to provision instances within the configured ondemand_request_ttl '#{config['ondemand_request_ttl']}'"
         status 200
-      elsif request_hash['status'] == 'deleted'
+      when 'deleted'
         result['message'] = 'The request has been deleted'
         status 200
       else
@@ -1059,7 +1063,7 @@ module Vmpooler
           result = atomically_allocate_vms(payload)
         else
           invalid.each do |bad_template|
-            metrics.increment('checkout.invalid.' + bad_template)
+            metrics.increment("checkout.invalid.#{bad_template}")
           end
           status 404
         end
@@ -1082,7 +1086,7 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      rdata = backend.hgetall('vmpooler__vm__' + params[:hostname])
+      rdata = backend.hgetall("vmpooler__vm__#{params[:hostname]}")
       unless rdata.empty?
         status 200
         result['ok'] = true
@@ -1093,7 +1097,7 @@ module Vmpooler
         result[params[:hostname]]['lifetime'] = (rdata['lifetime'] || config['vm_lifetime']).to_i
 
         if rdata['destroy']
-          result[params[:hostname]]['running'] = ((Time.parse(rdata['destroy']) - Time.parse(rdata['checkout'])) / 60 / 60).round(2)
+          result[params[:hostname]]['running'] = ((Time.parse(rdata['destroy']) - Time.parse(rdata['checkout'])) / 60 / 60).round(2) if rdata['checkout']
           result[params[:hostname]]['state'] = 'destroyed'
         elsif rdata['checkout']
           result[params[:hostname]]['running'] = ((Time.now - Time.parse(rdata['checkout'])) / 60 / 60).round(2)
@@ -1155,12 +1159,12 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      rdata = backend.hgetall('vmpooler__vm__' + params[:hostname])
+      rdata = backend.hgetall("vmpooler__vm__#{params[:hostname]}")
       unless rdata.empty?
         need_token! if rdata['token:token']
 
-        if backend.srem('vmpooler__running__' + rdata['template'], params[:hostname])
-          backend.sadd('vmpooler__completed__' + rdata['template'], params[:hostname])
+        if backend.srem("vmpooler__running__#{rdata['template']}", params[:hostname])
+          backend.sadd("vmpooler__completed__#{rdata['template']}", params[:hostname])
 
           status 200
           result['ok'] = true
@@ -1184,7 +1188,7 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      if backend.exists?('vmpooler__vm__' + params[:hostname])
+      if backend.exists?("vmpooler__vm__#{params[:hostname]}")
         begin
           jdata = JSON.parse(request.body.read)
         rescue StandardError
@@ -1212,13 +1216,8 @@ module Vmpooler
               end
 
             when 'tags'
-              unless arg.is_a?(Hash)
-                failure.push("You provided tags (#{arg}) as something other than a hash.")
-              end
-
-              if config['allowed_tags']
-                failure.push("You provided unsuppored tags (#{arg}).") if not (arg.keys - config['allowed_tags']).empty?
-              end
+              failure.push("You provided tags (#{arg}) as something other than a hash.") unless arg.is_a?(Hash)
+              failure.push("You provided unsuppored tags (#{arg}).") if config['allowed_tags'] && !(arg.keys - config['allowed_tags']).empty?
             else
               failure.push("Unknown argument #{arg}.")
           end
@@ -1235,7 +1234,7 @@ module Vmpooler
 
                 arg = arg.to_i
 
-                backend.hset('vmpooler__vm__' + params[:hostname], param, arg)
+                backend.hset("vmpooler__vm__#{params[:hostname]}", param, arg)
               when 'tags'
                 filter_tags(arg)
                 export_tags(backend, params[:hostname], arg)
@@ -1261,11 +1260,11 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      if ((params[:size].to_i > 0 )and (backend.exists?('vmpooler__vm__' + params[:hostname])))
+      if ((params[:size].to_i > 0 )and (backend.exists?("vmpooler__vm__#{params[:hostname]}")))
         result[params[:hostname]] = {}
         result[params[:hostname]]['disk'] = "+#{params[:size]}gb"
 
-        backend.sadd('vmpooler__tasks__disk', params[:hostname] + ':' + params[:size])
+        backend.sadd('vmpooler__tasks__disk', "#{params[:hostname]}:#{params[:size]}")
 
         status 202
         result['ok'] = true
@@ -1285,13 +1284,13 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      if backend.exists?('vmpooler__vm__' + params[:hostname])
+      if backend.exists?("vmpooler__vm__#{params[:hostname]}")
         result[params[:hostname]] = {}
 
         o = [('a'..'z'), ('0'..'9')].map(&:to_a).flatten
         result[params[:hostname]]['snapshot'] = o[rand(25)] + (0...31).map { o[rand(o.length)] }.join
 
-        backend.sadd('vmpooler__tasks__snapshot', params[:hostname] + ':' + result[params[:hostname]]['snapshot'])
+        backend.sadd('vmpooler__tasks__snapshot', "#{params[:hostname]}:#{result[params[:hostname]]['snapshot']}")
 
         status 202
         result['ok'] = true
@@ -1311,8 +1310,8 @@ module Vmpooler
 
       params[:hostname] = hostname_shorten(params[:hostname], config['domain'])
 
-      unless backend.hget('vmpooler__vm__' + params[:hostname], 'snapshot:' + params[:snapshot]).to_i.zero?
-        backend.sadd('vmpooler__tasks__snapshot-revert', params[:hostname] + ':' + params[:snapshot])
+      unless backend.hget("vmpooler__vm__#{params[:hostname]}", "snapshot:#{params[:snapshot]}").to_i.zero?
+        backend.sadd('vmpooler__tasks__snapshot-revert', "#{params[:hostname]}:#{params[:snapshot]}")
 
         status 202
         result['ok'] = true
